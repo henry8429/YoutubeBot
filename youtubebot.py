@@ -26,6 +26,14 @@ except ValueError:
     print('the BOT_COLOR in .env is not a valid hex color')
     print('using default color ff0000')
     COLOR = 0xff0000
+try:
+    DEFAULT_VOLUME = int(os.getenv('BOT_DEFAULT_VOLUME', '100'))
+    if not (0 <= DEFAULT_VOLUME <= 200):
+        print('the BOT_DEFAULT_VOLUME in .env must be between 0 and 200. using 100')
+        DEFAULT_VOLUME = 100
+except (ValueError):
+    print('the BOT_DEFAULT_VOLUME in .env is not a valid number. using 100')
+    DEFAULT_VOLUME = 100
 
 bot = commands.Bot(command_prefix=PREFIX, intents=discord.Intents(voice_states=True, guilds=True, guild_messages=True, message_content=True))
 queues = {} # {server_id: 'queue': [(vid_file, info), ...], 'loop': bool}
@@ -55,32 +63,133 @@ async def queue(ctx: commands.Context, *args):
 
 @bot.command(name='skip', aliases=['s'])
 async def skip(ctx: commands.Context, *args):
-    try: queue_length = len(queues[ctx.guild.id]['queue'])
-    except KeyError: queue_length = 0
-    if queue_length <= 0:
-        await ctx.send('the bot isn\'t playing anything')
+    server_id = ctx.guild.id
+    try:
+        queue_info = queues[server_id]
+        queue = queue_info['queue']
+        queue_length = len(queue)
+    except KeyError:
+        await ctx.send("the bot isn't playing anything")
+        return
+
     if not await sense_checks(ctx):
         return
 
-    try: n_skips = int(args[0])
+    voice_client = get_voice_client_from_channel_id(ctx.author.voice.channel.id)
+    if not voice_client or not voice_client.is_playing():
+        await ctx.send("the bot isn't playing anything")
+        return
+
+    try:
+        n_skips = int(args[0])
     except IndexError:
         n_skips = 1
     except ValueError:
-        if args[0] == 'all': n_skips = queue_length
-        else: n_skips = 1
-    if n_skips == 1:
-        message = 'skipping track'
-    elif n_skips < queue_length:
-        message = f'skipping `{n_skips}` of `{queue_length}` tracks'
+        if args[0].lower() == 'all':
+            n_skips = queue_length
+        else:
+            n_skips = 1
+    
+    if n_skips <= 0:
+        n_skips = 1
+
+    if n_skips >= queue_length:
+        await ctx.send('skipping all tracks')
+        # To ensure the queue ends, we can temporarily disable loop and clear upcoming tracks
+        queues[server_id]['loop'] = False
+        tracks_to_remove = queue[1:]
+        for path, _ in tracks_to_remove:
+            try:
+                os.remove(path)
+            except (FileNotFoundError, UnboundLocalError):
+                pass
+        del queue[1:]
+        # Stop the current track. after_track will handle cleanup and disconnecting.
+        voice_client.stop()
     else:
-        message = 'skipping all tracks'
-        n_skips = queue_length
-    await ctx.send(message)
+        message = f'skipping track' if n_skips == 1 else f'skipping `{n_skips}` of `{queue_length}` tracks'
+        await ctx.send(message)
+        
+        # Remove the tracks between the current one and the target one
+        tracks_to_remove = queue[1:n_skips]
+        for path, _ in tracks_to_remove:
+            try:
+                os.remove(path)
+            except (FileNotFoundError, UnboundLocalError):
+                pass
+        del queue[1:n_skips]
+        
+        # Stop the current track. after_track will pop it and play the new queue[0]
+        voice_client.stop()
+
+@bot.command(name='stop')
+async def stop(ctx: commands.Context, *args):
+    server_id = ctx.guild.id
+    if not await sense_checks(ctx):
+        return
 
     voice_client = get_voice_client_from_channel_id(ctx.author.voice.channel.id)
-    for _ in range(n_skips - 1):
-        queues[ctx.guild.id]['queue'].pop(0)
-    voice_client.stop()
+    if not voice_client:
+        await ctx.send("The bot is not in a voice channel.")
+        return
+
+    try:
+        # Clear the queue data structure
+        queues.pop(server_id)
+    except KeyError:
+        # This could happen if the bot is connected but not playing, which is fine.
+        pass
+
+    try:
+        # Delete the download directory
+        shutil.rmtree(f'./dl/{server_id}/')
+    except FileNotFoundError:
+        pass
+
+    # Stop playback and disconnect
+    if voice_client.is_playing():
+        voice_client.stop()
+    await voice_client.disconnect()
+    await ctx.send("Playback stopped and queue cleared.")
+
+
+
+@bot.command(name='volume', aliases=['v'])
+async def volume(ctx: commands.Context, *args):
+    if not await sense_checks(ctx):
+        return
+
+    voice_client = get_voice_client_from_channel_id(ctx.author.voice.channel.id)
+    if voice_client is None:
+        await ctx.send('The bot is not in a voice channel.')
+        return
+
+    server_id = ctx.guild.id
+    if not args:
+        try:
+            current_volume = int(queues[server_id]['volume'] * 100)
+            await ctx.send(f'Current volume is {current_volume}%')
+        except KeyError:
+            await ctx.send('The bot is not playing anything.')
+        return
+
+    try:
+        new_volume = int(args[0].replace('%', ''))
+        if not (0 <= new_volume <= 200):
+            await ctx.send('Volume must be between 0 and 200.')
+            return
+
+        try:
+            queues[server_id]['volume'] = new_volume / 100
+        except KeyError:
+            await ctx.send('The bot is not playing anything.')
+            return
+        if voice_client.source:
+            voice_client.source.volume = new_volume / 100
+        await ctx.send(f'Volume set to {new_volume}%')
+
+    except (ValueError, IndexError):
+        await ctx.send('Invalid volume value. Please use a number between 0 and 200.')
 
 @bot.command(name='play', aliases=['p'])
 async def play(ctx: commands.Context, *args):
@@ -125,10 +234,11 @@ async def play(ctx: commands.Context, *args):
         try:
             queues[server_id]['queue'].append((path, info))
         except KeyError: # first in queue
-            queues[server_id] = {'queue': [(path, info)], 'loop': False}
+            queues[server_id] = {'queue': [(path, info)], 'loop': False, 'volume': DEFAULT_VOLUME / 100}
             try: connection = await voice_state.channel.connect()
             except discord.ClientException: connection = get_voice_client_from_channel_id(voice_state.channel.id)
-            connection.play(discord.FFmpegOpusAudio(path), after=lambda error=None, connection=connection, server_id=server_id:
+            audio_source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(path), volume=queues[server_id]['volume'])
+            connection.play(audio_source, after=lambda error=None, connection=connection, server_id=server_id:
                                                              after_track(error, connection, server_id))
 
 @bot.command('loop', aliases=['l'])
@@ -161,7 +271,9 @@ def after_track(error, connection, server_id):
     if last_video_path not in [i[0] for i in queues[server_id]['queue']]: # check that the same video isn't queued multiple times
         try: os.remove(last_video_path)
         except FileNotFoundError: pass
-    try: connection.play(discord.FFmpegOpusAudio(queues[server_id]['queue'][0][0]), after=lambda error=None, connection=connection, server_id=server_id:
+    try: 
+        audio_source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(queues[server_id]['queue'][0][0]), volume=queues[server_id]['volume'])
+        connection.play(audio_source, after=lambda error=None, connection=connection, server_id=server_id:
                                                                           after_track(error, connection, server_id))
     except IndexError: # that was the last item in queue
         queues.pop(server_id) # directory will be deleted on disconnect
@@ -207,7 +319,7 @@ async def on_command_error(ctx: discord.ext.commands.Context, err: discord.ext.c
     # we ran out of handlable exceptions, re-start. type_ and value are None for these
     sys.stderr.write(f'unhandled command error raised, {err=}')
     sys.stderr.flush()
-    sp.run(['./restart'])
+    os.execv(sys.executable, ['python'] + sys.argv)
 
 @bot.event
 async def on_ready():
